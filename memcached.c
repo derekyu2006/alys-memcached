@@ -399,18 +399,18 @@ static void conn_init(void) {
 
   /* But if possible, get the actual highest FD we can possibly ever see. */
   if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-  max_fds = rl.rlim_max;
+    max_fds = rl.rlim_max;
   } else {
-  fprintf(stderr, "Failed to query maximum file descriptor; "
+    fprintf(stderr, "Failed to query maximum file descriptor; "
       "falling back to maxconns\n");
   }
 
   close(next_fd);
 
   if ((conns = calloc(max_fds, sizeof(conn *))) == NULL) {
-  fprintf(stderr, "Failed to allocate connection structures\n");
-  /* This is unrecoverable so bail out early. */
-  exit(1);
+    fprintf(stderr, "Failed to allocate connection structures\n");
+    /* This is unrecoverable so bail out early. */
+    exit(1);
   }
 }
 
@@ -3181,7 +3181,8 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
 }
 
 /* ntokens is overwritten here... shrug.. */
-static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
+static inline void process_get_command(conn *c, token_t *tokens,
+    size_t ntokens, bool return_cas) {
   char *key;
   size_t nkey;
   int i = 0;
@@ -3372,7 +3373,8 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
   }
 }
 
-static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
+static void process_update_command(conn *c, token_t *tokens,
+    const size_t ntokens, int comm, bool handle_cas) {
   char *key;
   size_t nkey;
   unsigned int flags;
@@ -5647,7 +5649,7 @@ int main (int argc, char **argv) {
   settings_init();
 
   /* Run regardless of initializing it later */
-  init_lru_crawler();
+  init_lru_crawler(); // LRU爬虫是一个单独的线程，会去清理失效的ITEM
   init_lru_maintainer();
 
   hash_init(hash_type) != 0
