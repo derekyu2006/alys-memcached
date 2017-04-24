@@ -5671,14 +5671,20 @@ int main (int argc, char **argv) {
   if (start_assoc_maintenance_thread() == -1) {
   }
 
+  // 启动item爬虫线程
+  // 该爬虫线程的功能是自动删除过期的item, 因为memcache默认是懒惰删除法,
+  // 就是等客户端get这个item的时候去判断是否过期如果过期则删除但是如果
+  // 客户端一直不去get这个item, 那么这个item就会一直占用资源不会被释放掉,
+  // 所以本爬虫线程就是为了解决这个问题。
   if (start_lru_crawler && start_item_crawler_thread() != 0) {
   }
 
+  // 启动lru维护爬虫线程
   if (start_lru_maintainer && start_lru_maintainer_thread() != 0) {
   }
 
-  if (settings.slab_reassign &&
-    start_slab_maintenance_thread() == -1) {
+  // 启动slab维护爬虫线程
+  if (settings.slab_reassign && start_slab_maintenance_thread() == -1) {
   }
 
   if (settings.idle_timeout && start_conn_timeout_thread() == -1) {

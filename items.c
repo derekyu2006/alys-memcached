@@ -167,20 +167,6 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
   if (id == 0)
     return 0;
 
-  /* If no memory is available, attempt a direct LRU juggle/eviction */
-  /* This is a race in order to simplify lru_pull_tail; in cases where
-   * locked items are on the tail, you want them to fall out and cause
-   * occasional OOM's, rather than internally work around them.
-   * This also gives one fewer code path for slab alloc/free
-   */
-  /* TODO: if power_largest, try a lot more times? or a number of times
-   * based on how many chunks the new object should take up?
-   * or based on the size of an object lru_pull_tail() says it evicted?
-   * This is a classical GC problem if "large items" are of too varying of
-   * sizes. This is actually okay here since the larger the data, the more
-   * bandwidth it takes, the more time we can loop in comparison to serving
-   * and replacing small items.
-   */
   for (i = 0; i < 10; i++) {
     uint64_t total_bytes;
     /* Try to reclaim memory first */
@@ -1234,8 +1220,8 @@ int start_lru_maintainer_thread(void) {
   pthread_mutex_lock(&lru_maintainer_lock);
   do_run_lru_maintainer_thread = 1;
   settings.lru_maintainer_thread = true;
-  if ((ret = pthread_create(&lru_maintainer_tid, NULL,
-    lru_maintainer_thread, NULL)) != 0) {
+  if ((ret = pthread_create(&lru_maintainer_tid, NULL, lru_maintainer_thread,
+      NULL)) != 0) {
     fprintf(stderr, "Can't create LRU maintainer thread: %s\n",
       strerror(ret));
     pthread_mutex_unlock(&lru_maintainer_lock);
@@ -1310,25 +1296,17 @@ void do_item_unlinktail_q(item *it) {
  * more clearly. */
 item *do_item_crawl_q(item *it) {
   item **head, **tail;
-  assert(it->it_flags == 1);
-  assert(it->nbytes == 0);
   head = &heads[it->slabs_clsid];
   tail = &tails[it->slabs_clsid];
 
-  /* We've hit the head, pop off */
-  if (it->prev == 0) {
-    assert(*head == it);
+  if (it->prev == 0) { // 说明是爬虫结点是头结点
     if (it->next) {
       *head = it->next;
-      assert(it->next->prev == it);
       it->next->prev = 0;
     }
     return NULL; /* Done */
   }
 
-  /* Swing ourselves in front of the next item */
-  /* NB: If there is a prev, we can't be the head */
-  assert(it->prev != it);
   if (it->prev) {
     if (*head == it->prev) {
       /* Prev was the head, now we're the head */
@@ -1338,26 +1316,25 @@ item *do_item_crawl_q(item *it) {
       /* We are the tail, now they are the tail */
       *tail = it->prev;
     }
-    assert(it->next != it);
     if (it->next) {
-      assert(it->prev->next == it);
       it->prev->next = it->next;
       it->next->prev = it->prev;
     } else {
       /* Tail. Move this above? */
       it->prev->next = 0;
     }
-    /* prev->prev's next is it->prev */
+
+    // item_1 -> item_2 -> crawler_item
+    // item_1 -> crawler_item -> item_2
+    // 这里就完成了爬虫结点前移一个的功能.
     it->next = it->prev;
     it->prev = it->next->prev;
     it->next->prev = it;
-    /* New it->prev now, if we're not at the head. */
     if (it->prev) {
       it->prev->next = it;
     }
   }
-  assert(it->next != it);
-  assert(it->prev != it);
 
+  // 返回被craw移动的那个结点.
   return it->next; /* success */
 }

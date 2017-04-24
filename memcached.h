@@ -413,22 +413,23 @@ enum crawler_run_type {
   CRAWLER_EXPIRED=0, CRAWLER_METADUMP
 };
 
+// 这个结构体和item结构体长得很像,是伪item结构体，用于LRU爬虫
 typedef struct {
   struct _stritem *next;
   struct _stritem *prev;
-  struct _stritem *h_next;  /* hash chain next */
-  rel_time_t    time;     /* least recent access */
-  rel_time_t    exptime;  /* expire time */
-  int       nbytes;   /* size of data */
+  struct _stritem *h_next;
+  rel_time_t    time;
+  rel_time_t    exptime;
+  int       nbytes;
   unsigned short  refcount;
-  uint8_t     nsuffix;  /* length of flags-and-length string */
-  uint8_t     it_flags;   /* ITEM_* above */
-  uint8_t     slabs_clsid;/* which slab class we're in */
-  uint8_t     nkey;     /* key length, w/terminating null and padding */
-  uint32_t    remaining;  /* Max keys to crawl per slab per invocation */
-  uint64_t    reclaimed;  /* items reclaimed during this crawl. */
-  uint64_t    unfetched;  /* items reclaiemd unfetched during this crawl. */
-  uint64_t    checked;  /* items examined during this crawl. */
+  uint8_t     nsuffix;
+  uint8_t     it_flags;
+  uint8_t     slabs_clsid;
+  uint8_t     nkey;
+  uint32_t    remaining;
+  uint64_t    reclaimed;
+  uint64_t    unfetched;
+  uint64_t    checked;
 } crawler;
 
 /* Header when an item is actually a chunk of another item. */
