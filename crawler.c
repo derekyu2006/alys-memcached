@@ -181,16 +181,6 @@ static void crawler_expired_eval(crawler_module_t *cm, item *search, uint32_t hv
     crawlers[i].reclaimed++;
     s->reclaimed++;
 
-    if (settings.verbose > 1) {
-      int ii;
-      char *key = ITEM_key(search);
-      fprintf(stderr, "LRU crawler found an expired item (flags: %d, slab: %d): ",
-        search->it_flags, search->slabs_clsid);
-      for (ii = 0; ii < search->nkey; ++ii) {
-        fprintf(stderr, "%c", key[ii]);
-      }
-      fprintf(stderr, "\n");
-    }
     if ((search->it_flags & ITEM_FETCHED) == 0 && !is_flushed) {
       crawlers[i].unfetched++;
     }
@@ -405,6 +395,7 @@ static void *item_crawler_thread(void *arg) {
           pthread_mutex_unlock(&lru_locks[i]);
         }
         // 最重要的函数.
+        // 最终还是调用到crawler_expired_eval
         active_crawler_mod.mod->eval(&active_crawler_mod, search, hv, i);
 
         if (hold_lock)
@@ -434,16 +425,12 @@ static void *item_crawler_thread(void *arg) {
       active_crawler_mod.mod = NULL;
     }
 
-    if (settings.verbose > 2)
-      fprintf(stderr, "LRU crawler thread sleeping\n");
     STATS_LOCK();
     stats_state.lru_crawler_running = false;
     STATS_UNLOCK();
   }
 
   pthread_mutex_unlock(&lru_crawler_lock);
-  if (settings.verbose > 2)
-    fprintf(stderr, "LRU crawler thread stopping\n");
 
   return NULL;
 }

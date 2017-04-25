@@ -394,8 +394,6 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
 
 void do_item_remove(item *it) {
   MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
-  assert((it->it_flags & ITEM_SLABBED) == 0);
-  assert(it->refcount > 0);
 
   if (refcount_decr(&it->refcount) == 0) {
     item_free(it);
@@ -772,18 +770,6 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
   }
   int was_found = 0;
 
-  if (settings.verbose > 2) {
-    int ii;
-    if (it == NULL) {
-      fprintf(stderr, "> NOT FOUND ");
-    } else {
-      fprintf(stderr, "> FOUND KEY ");
-    }
-    for (ii = 0; ii < nkey; ++ii) {
-      fprintf(stderr, "%c", key[ii]);
-    }
-  }
-
   if (it != NULL) {
     was_found = 1;
     if (item_is_flushed(it)) {
@@ -793,9 +779,6 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
       pthread_mutex_lock(&c->thread->stats.mutex);
       c->thread->stats.get_flushed++;
       pthread_mutex_unlock(&c->thread->stats.mutex);
-      if (settings.verbose > 2) {
-        fprintf(stderr, " -nuked by flush");
-      }
       was_found = 2;
     } else if (it->exptime != 0 && it->exptime <= current_time) {
       do_item_unlink(it, hv);
@@ -804,21 +787,12 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
       pthread_mutex_lock(&c->thread->stats.mutex);
       c->thread->stats.get_expired++;
       pthread_mutex_unlock(&c->thread->stats.mutex);
-      if (settings.verbose > 2) {
-        fprintf(stderr, " -nuked by expire");
-      }
       was_found = 3;
     } else {
       it->it_flags |= ITEM_FETCHED|ITEM_ACTIVE;
       DEBUG_REFCNT(it, '+');
     }
   }
-
-  if (settings.verbose > 2)
-    fprintf(stderr, "\n");
-  /* For now this is in addition to the above verbose logging. */
-  LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey,
-         (it) ? ITEM_clsid(it) : 0);
 
   return it;
 }
@@ -1019,6 +993,10 @@ static int lru_pull_tail(const int orig_id, const int cur_lru,
  * locks can't handle much more than that. Leaving a TODO for how to
  * autoadjust in the future.
  */
+// 获取slabs_clsid下有多少空闲的item
+// chunks_free    空闲item 数量
+// total_chunks   总item 数量(已使用+未使用)
+// chunks_perslab 该slabs_clsid 下的 chunk 最多能包含多少个 item
 static int lru_maintainer_juggle(const int slabs_clsid) {
   int i;
   int did_moves = 0;
@@ -1032,19 +1010,19 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
   if (settings.expirezero_does_not_evict)
     total_bytes -= noexp_lru_size(slabs_clsid);
 
-  /* If slab automove is enabled on any level, and we have more than 2 pages
-   * worth of chunks free in this class, ask (gently) to reassign a page
-   * from this class back into the global pool (0)
-   */
+  // settings.slab_automove 默认等于0
+  // 这里的chunks_free判断就是上面说的触发slab爬虫线程的关键
+  // 当空闲的item大于2.5个chunk则执行回收流程,上面介绍过.
   if (settings.slab_automove > 0 && chunks_free > (chunks_perslab * 2.5)) {
+    // 调用该函数, 触发信号, 执行slab爬虫线程
     slabs_reassign(slabs_clsid, SLAB_GLOBAL_PAGE_POOL);
   }
 
-  /* Juggle HOT/WARM up to N times */
+  // 循环1000次调整该slabs_clsid下面的三条队列item
   for (i = 0; i < 1000; i++) {
     int do_more = 0;
     if (lru_pull_tail(slabs_clsid, HOT_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS) ||
-      lru_pull_tail(slabs_clsid, WARM_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS)) {
+        lru_pull_tail(slabs_clsid, WARM_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS)) {
       do_more++;
     }
     do_more += lru_pull_tail(slabs_clsid, COLD_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS);
@@ -1071,6 +1049,7 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
  */
 static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, logger *l) {
   int i;
+  // 保存每个slab_id 爬虫的开始状态
   static rel_time_t next_crawls[MAX_NUMBER_OF_SLAB_CLASSES];
   static rel_time_t next_crawl_wait[MAX_NUMBER_OF_SLAB_CLASSES];
   uint8_t todo[MAX_NUMBER_OF_SLAB_CLASSES];
@@ -1080,7 +1059,9 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
     return;
   }
 
+  // 循环所有slab_id
   for (i = POWER_SMALLEST; i < MAX_NUMBER_OF_SLAB_CLASSES; i++) {
+    // 获取每个slab_id的爬虫状态
     crawlerstats_t *s = &cdata->crawlerstats[i];
     /* We've not successfully kicked off a crawl yet. */
     if (s->run_complete) {
@@ -1096,7 +1077,9 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
       rel_time_t since_run = current_time - s->end_time;
       /* Don't bother if the payoff is too low. */
       for (x = 0; x < 60; x++) {
+        // 记录当前时间到爬取结束时间这个范围内共有多少item即将过期
         available_reclaims += s->histo[x];
+        // 判断过期的item数量是否大于未过期的item数量百分之一
         if (available_reclaims > low_watermark) {
           if (next_crawl_wait[i] < (x * 60)) {
             next_crawl_wait[i] += 60;
@@ -1116,13 +1099,6 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
       }
 
       next_crawls[i] = current_time + next_crawl_wait[i] + 5;
-      LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_CRAWLER_STATUS, NULL, i, (unsigned long long)low_watermark,
-          (unsigned long long)available_reclaims,
-          (unsigned int)since_run,
-          next_crawls[i] - current_time,
-          s->end_time - s->start_time,
-          s->seen,
-          s->reclaimed);
       // Got our calculation, avoid running until next actual run.
       s->run_complete = false;
       pthread_mutex_unlock(&cdata->lock);
@@ -1133,6 +1109,7 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
       next_crawls[i] = current_time + 5; // minimum retry wait.
     }
   }
+
   if (do_run) {
     lru_crawler_start(todo, 0, CRAWLER_EXPIRED, cdata, NULL, 0);
   }
@@ -1158,8 +1135,6 @@ static void *lru_maintainer_thread(void *arg) {
   }
 
   pthread_mutex_lock(&lru_maintainer_lock);
-  if (settings.verbose > 2)
-    fprintf(stderr, "Starting LRU maintainer background thread\n");
   while (do_run_lru_maintainer_thread) {
     int did_moves = 0; // 已完成数目
     pthread_mutex_unlock(&lru_maintainer_lock);
@@ -1169,12 +1144,13 @@ static void *lru_maintainer_thread(void *arg) {
     STATS_LOCK();
     stats.lru_maintainer_juggles++;
     STATS_UNLOCK();
-    /* We were asked to immediately wake up and poke a particular slab
-     * class due to a low watermark being hit */
+    // 搜索源代码发现lru_maintainer_check_clsid一直都等于0
+    // 所以默认应该不会命中该if条件
     if (lru_maintainer_check_clsid != 0) {
       did_moves = lru_maintainer_juggle(lru_maintainer_check_clsid);
       lru_maintainer_check_clsid = 0;
     } else {
+      // 循环获取slab id然后依次调用
       for (i = POWER_SMALLEST; i < MAX_NUMBER_OF_SLAB_CLASSES; i++) {
         did_moves += lru_maintainer_juggle(i);
       }
@@ -1187,15 +1163,15 @@ static void *lru_maintainer_thread(void *arg) {
       if (to_sleep < MIN_LRU_MAINTAINER_SLEEP)
         to_sleep = MIN_LRU_MAINTAINER_SLEEP;
     }
-    /* Once per second at most */
+
+    // 判断是否开启了item爬虫线程
     if (settings.lru_crawler && last_crawler_check != current_time) {
       lru_maintainer_crawler_check(&cdata, l);
       last_crawler_check = current_time;
     }
   }
+
   pthread_mutex_unlock(&lru_maintainer_lock);
-  if (settings.verbose > 2)
-    fprintf(stderr, "LRU maintainer thread stopping\n");
 
   return NULL;
 }
