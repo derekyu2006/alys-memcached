@@ -341,7 +341,7 @@ static void *item_crawler_thread(void *arg) {
       // 的时候处于堵塞状态,大大降低的并发度,所以这样去实现,每个队列发现有爬虫之后
       // 只处理移动一次,然后马上释放锁,等下次循环的时候再继续移动处理,降低锁的开销
       for (i = POWER_SMALLEST; i < LARGEST_ID; i++) { //
-        if (crawlers[i].it_flags != 1) {
+        if (crawlers[i].it_flags != 1) { // 如果当前这条LRU队列添加了爬虫, 这个地方就会置1
           continue;
         }
 
@@ -482,25 +482,27 @@ int start_item_crawler_thread(void) {
   return 0;
 }
 
-/* 'remaining' is passed in so the LRU maintainer thread can scrub the whole
- * LRU every time.
- */
 static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
   int i;
   uint32_t sid;
   uint32_t tocrawl[3];
   int starts = 0;
+  // 获取当前slab id下每个lru队列位置的索引
   tocrawl[0] = id | HOT_LRU;
   tocrawl[1] = id | WARM_LRU;
   tocrawl[2] = id | COLD_LRU;
 
+  // 每一个slab[x]对应三条队列, 分别是 HOT_LRU、WARM_LRU、COLD_LRU
+  // HOT_LRU: 新获取的item添加到HOT_LRU队列, 如果访问HOT_LRU队尾的item
+  //          则挪到HOT_LRU队头, 超出HOT_LRU队列限额之后在挪到COLD_LRU队列.
+  // COLD_LRU: 如果访问COLD_LRU队尾的item则挪到WARM_LRU队列.
+  // WARM_LRU: 如果访问WARM_LRU队尾的item则挪到WARM_LRU队头, 超出WARM_LRU
+  //           队列限额之后在挪到COLD_LRU队列。
   for (i = 0; i < 3; i++) {
     sid = tocrawl[i];
+    // 只对当前slab id下的sid队列加锁, 把锁的颗粒度尽可能的降低
     pthread_mutex_lock(&lru_locks[sid]);
-    // TODO: Pretty sure this is a needless optimization.
-    //if (tails[sid] != NULL) {
-      if (settings.verbose > 2)
-        fprintf(stderr, "Kicking LRU crawler off for LRU %u\n", sid);
+    if (tails[sid] != NULL) {
       crawlers[sid].nbytes = 0;
       crawlers[sid].nkey = 0;
       crawlers[sid].it_flags = 1; /* For a crawler, this means enabled. */
@@ -512,10 +514,14 @@ static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
       crawlers[sid].reclaimed = 0;
       crawlers[sid].unfetched = 0;
       crawlers[sid].checked = 0;
+      // 把这个爬虫item插入到当前队列的尾部,因为到时候item爬虫线程
+      // 要去不断移动这个爬虫item,以达到获取到其他的item作用,直到移动
+      // 到队列头部结束.
       do_item_linktail_q((item *)&crawlers[sid]);
+      // 记录要处理的lru队列数
       crawler_count++;
       starts++;
-    //}
+    }
     pthread_mutex_unlock(&lru_locks[sid]);
   }
   if (starts) {
