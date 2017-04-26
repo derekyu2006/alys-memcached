@@ -639,6 +639,8 @@ static int slab_rebalance_start(void) {
   slabclass_t *s_cls;
   int no_go = 0;
 
+  // 只要对slab区操作就要加锁,这里的加锁是针对全局的slab_id[1~63]
+  // 所以锁的开销稍微大一些
   pthread_mutex_lock(&slabs_lock);
 
   if (slab_rebal.s_clsid < POWER_SMALLEST ||
@@ -648,35 +650,37 @@ static int slab_rebalance_start(void) {
     slab_rebal.s_clsid == slab_rebal.d_clsid)
     no_go = -2;
 
+  // 取出s_clsid信息
   s_cls = &slabclass[slab_rebal.s_clsid];
 
+  // 增大slab数组的大小, 用来存放可能移过来的chunk.
   if (!grow_slab_list(slab_rebal.d_clsid)) {
     no_go = -1;
   }
 
+  // 源slab页太少了, 无法分一个页给别人.
   if (s_cls->slabs < 2)
     no_go = -3;
 
   if (no_go != 0) {
     pthread_mutex_unlock(&slabs_lock);
-    return no_go; /* Should use a wrapper function... */
+    return no_go;
   }
 
-  /* Always kill the first available slab page as it is most likely to
-   * contain the oldest items
-   */
-  slab_rebal.slab_start = s_cls->slab_list[0];
+  // 标志将源slab class的第几个内存页分给目标slab class
+  // 这里是默认是将第一个内存页分给目标slab class
+  s_cls->killing = 1;
+
+  // 记录要移动的页的信息。slab_start指向页的开始位置.
+  // slab_end指向页的结束位置。slab_pos则记录当前处理的位置(item)
+  slab_rebal.slab_start = s_cls->slab_list[s_cls->killing - 1];
   slab_rebal.slab_end   = (char *)slab_rebal.slab_start +
     (s_cls->size * s_cls->perslab);
   slab_rebal.slab_pos   = slab_rebal.slab_start;
   slab_rebal.done     = 0;
 
-  /* Also tells do_item_get to search for items in this slab */
+  // 要rebalance线程接下来进行内存页移动
   slab_rebalance_signal = 2;
-
-  if (settings.verbose > 1) {
-    fprintf(stderr, "Started a slab rebalance\n");
-  }
 
   pthread_mutex_unlock(&slabs_lock);
 
@@ -737,23 +741,6 @@ enum move_status {
   MOVE_PASS=0, MOVE_FROM_SLAB, MOVE_FROM_LRU, MOVE_BUSY, MOVE_LOCKED
 };
 
-/* refcount == 0 is safe since nobody can incr while item_lock is held.
- * refcount != 0 is impossible since flags/etc can be modified in other
- * threads. instead, note we found a busy one and bail. logic in do_item_get
- * will prevent busy items from continuing to be busy
- * NOTE: This is checking it_flags outside of an item lock. I believe this
- * works since it_flags is 8 bits, and we're only ever comparing a single bit
- * regardless. ITEM_SLABBED bit will always be correct since we're holding the
- * lock which modifies that bit. ITEM_LINKED won't exist if we're between an
- * item having ITEM_SLABBED removed, and the key hasn't been added to the item
- * yet. The memory barrier from the slabs lock should order the key write and the
- * flags to the item?
- * If ITEM_LINKED did exist and was just removed, but we still see it, that's
- * still safe since it will have a valid key, which we then lock, and then
- * recheck everything.
- * This may not be safe on all platforms; If not, slabs_alloc() will need to
- * seed the item key while holding slabs_lock.
- */
 static int slab_rebalance_move(void) {
   slabclass_t *s_cls;
   int x;
@@ -765,12 +752,18 @@ static int slab_rebalance_move(void) {
 
   pthread_mutex_lock(&slabs_lock);
 
+  // 取出源slab信息
   s_cls = &slabclass[slab_rebal.s_clsid];
 
+  // 这里默认一次只循环一次,也就是在移除chunk里面item的时候,一次只移除一个item
+  // 不过可以在启动的时候设定这个slab_bulk_check循环次数
+  // 尽可能的还是把这个变量设置小一些,保证只循环一次就退出循环,因为这样可以减小锁的颗粒度
+  // 可以看到上面slab是全局锁,如果我们当前这个slab id一直占用锁,会导致其它的slab id
+  // 也都无法操作,所以这里每次循环处理完一个item之后马上释放锁,然后在获取锁在进行处理
   for (x = 0; x < slab_bulk_check; x++) {
     hv = 0;
     hold_lock = NULL;
-    item *it = slab_rebal.slab_pos;
+    item *it = slab_rebal.slab_pos; // 获取item
     item_chunk *ch = NULL;
     status = MOVE_PASS;
     if (it->it_flags & ITEM_CHUNK) {
@@ -783,53 +776,51 @@ static int slab_rebalance_move(void) {
       assert(it->it_flags & ITEM_CHUNKED);
     }
 
-    /* ITEM_FETCHED when ITEM_SLABBED is overloaded to mean we've cleared
-     * the chunk for move. Only these two flags should exist.
-     */
+    // 如果it_flags&ITEM_SLABBED为真，那么就说明这个item
+    // 根本就没有分配出去。如果为假，那么说明这个item被分配
+    // 出去了，但处于归还途中。参考do_item_get函数里面的
+    // 判断语句，有slab_rebalance_signal作为判断条件的那个
     if (it->it_flags != (ITEM_SLABBED|ITEM_FETCHED)) {
-      /* ITEM_SLABBED can only be added/removed under the slabs_lock */
-      if (it->it_flags & ITEM_SLABBED) {
-        assert(ch == NULL);
-        slab_rebalance_cut_free(s_cls, it);
+      if (it->it_flags & ITEM_SLABBED) { // 没有分配出去, 即时空闲的item.
+        // 把当前item从空闲s_cls->slots链表移动出来，因为我们要回收这个chunk
+        // 所以这个chunk里面的item就不能在被当前slab引用了.
+        if (s_cls->slots == it) {
+          s_cls->slots = it->next;
+        }
+        if (it->next) it->next->prev = it->prev;
+        if (it->prev) it->prev->next = it->next;
+        s_cls->sl_curr--;
         status = MOVE_FROM_SLAB;
-      } else if ((it->it_flags & ITEM_LINKED) != 0) {
-        /* If it doesn't have ITEM_SLABBED, the item could be in any
-         * state on its way to being freed or written to. If no
-         * ITEM_SLABBED, but it's had ITEM_LINKED, it must be active
-         * and have the key written to it already.
-         */
+      } else if ((it->it_flags & ITEM_LINKED) != 0) { // 是否被使用的item
+        // 获取哈希锁并试图锁它, 如果锁失败了, 则代表这个item正在忙
         hv = hash(ITEM_key(it), it->nkey);
         if ((hold_lock = item_trylock(hv)) == NULL) {
           status = MOVE_LOCKED;
-        } else {
-          refcount = refcount_incr(&it->refcount);
-          if (refcount == 2) { /* item is linked but not busy */
-            /* Double check ITEM_LINKED flag here, since we're
-             * past a memory barrier from the mutex. */
+        } else { // 说明这个item虽然被使用但当前没有被访问.
+          refcount = refcount_incr(&it->refcount); // 更新下引用计数.
+          if (refcount == 2) {
+            //double check, 判断一次是否被使用的item
             if ((it->it_flags & ITEM_LINKED) != 0) {
+              // 把这个被使用的item复制到其他chunk下
               status = MOVE_FROM_LRU;
             } else {
-              /* refcount == 1 + !ITEM_LINKED means the item is being
-               * uploaded to, or was just unlinked but hasn't been freed
-               * yet. Let it bleed off on its own and try again later */
+              // 如果不是则可能刚巧同一时间被删除了,所以改成正在忙的状态
+              // 下次循环再看一次
               status = MOVE_BUSY;
             }
           } else {
-            if (settings.verbose > 2) {
-              fprintf(stderr, "Slab reassign hit a busy item: refcount: %d (%d -> %d)\n",
-                it->refcount, slab_rebal.s_clsid, slab_rebal.d_clsid);
-            }
+            //如果引用+1不等于2则代表其他线程正在操作该item,正在忙
             status = MOVE_BUSY;
           }
-          /* Item lock must be held while modifying refcount */
+
+          // 当这个item当前正在被working线程访问的时候
+          // 这里就放弃对它的移动操作. 恢复现场.
           if (status == MOVE_BUSY) {
             refcount_decr(&it->refcount);
             item_trylock_unlock(hold_lock);
           }
         }
       } else {
-        /* See above comment. No ITEM_SLABBED or ITEM_LINKED. Mark
-         * busy and wait for item to complete its upload. */
         status = MOVE_BUSY;
       }
     }
@@ -839,50 +830,38 @@ static int slab_rebalance_move(void) {
     size_t ntotal = 0;
     switch (status) {
       case MOVE_FROM_LRU:
-        /* Lock order is LRU locks -> slabs_lock. unlink uses LRU lock.
-         * We only need to hold the slabs_lock while initially looking
-         * at an item, and at this point we have an exclusive refcount
-         * (2) + the item is locked. Drop slabs lock, drop item to
-         * refcount 1 (just our own, then fall through and wipe it
-         */
-        /* Check if expired or flushed */
+        // 当前item总占用字节数
         ntotal = ITEM_ntotal(it);
-        /* REQUIRES slabs_lock: CHECK FOR cls->sl_curr > 0 */
         if (ch == NULL && (it->it_flags & ITEM_CHUNKED)) {
-          /* Chunked should be identical to non-chunked, except we need
-           * to swap out ntotal for the head-chunk-total. */
           ntotal = s_cls->size;
         }
+        // 判断当前是否到期了.
         if ((it->exptime != 0 && it->exptime < current_time)
-          || item_is_flushed(it)) {
-          /* Expired, don't save. */
+            || item_is_flushed(it)) {
           save_item = 0;
         } else if (ch == NULL &&
             (new_it = slab_rebalance_alloc(ntotal, slab_rebal.s_clsid)) == NULL) {
-          /* Not a chunk of an item, and nomem. */
           save_item = 0;
           slab_rebal.evictions_nomem++;
         } else if (ch != NULL &&
             (new_it = slab_rebalance_alloc(s_cls->size, slab_rebal.s_clsid)) == NULL) {
-          /* Is a chunk of an item, and nomem. */
           save_item = 0;
           slab_rebal.evictions_nomem++;
         } else {
-          /* Was whatever it was, and we have memory for it. */
           save_item = 1;
         }
         pthread_mutex_unlock(&slabs_lock);
         unsigned int requested_adjust = 0;
+        //把当前的item内容copy到新的new_it下
         if (save_item) {
           if (ch == NULL) {
-            assert((new_it->it_flags & ITEM_CHUNKED) == 0);
-            /* if free memory, memcpy. clear prev/next/h_bucket */
             memcpy(new_it, it, ntotal);
             new_it->prev = 0;
             new_it->next = 0;
             new_it->h_next = 0;
-            /* These are definitely required. else fails assert */
             new_it->it_flags &= ~ITEM_LINKED;
+            // 把当前item引用全部释放掉, 在把新的new_it全部引用上
+            // 这样就相当于把当前item移动copy到其他chunk下了,把当前item位置腾出来了
             new_it->refcount = 0;
             do_item_replace(it, new_it, hv);
             /* Need to walk the chunks and repoint head  */
@@ -917,20 +896,16 @@ static int slab_rebalance_move(void) {
             refcount_decr(&it->refcount);
             requested_adjust = s_cls->size;
           }
-        } else {
-          /* restore ntotal in case we tried saving a head chunk. */
+        } else { // 把当前item引用全部释放掉
           ntotal = ITEM_ntotal(it);
           do_item_unlink(it, hv);
           slabs_free(it, ntotal, slab_rebal.s_clsid);
-          /* Swing around again later to remove it from the freelist. */
           slab_rebal.busy_items++;
           was_busy++;
         }
         item_trylock_unlock(hold_lock);
         pthread_mutex_lock(&slabs_lock);
-        /* Always remove the ntotal, as we added it in during
-         * do_slabs_alloc() when copying the item.
-         */
+        // 把当前item占用的字节数从总占用字节数里面减去
         s_cls->requested -= requested_adjust;
         break;
       case MOVE_FROM_SLAB:
@@ -942,6 +917,7 @@ static int slab_rebalance_move(void) {
         break;
       case MOVE_BUSY:
       case MOVE_LOCKED:
+        // 记录一下正在忙的item数量
         slab_rebal.busy_items++;
         was_busy++;
         break;
@@ -949,20 +925,26 @@ static int slab_rebalance_move(void) {
         break;
     }
 
+    // 如果本次item正在忙没有移动走, 那么也会把指针移动到下个item的位置处理下个item
+    // 等这一圈全部循环完之后,回过头来发现刚才有正在忙的item没有移动走,
+    // 那么会再继续循环一轮直到把chunk内所有item全部移除完毕。
     slab_rebal.slab_pos = (char *)slab_rebal.slab_pos + s_cls->size;
     if (slab_rebal.slab_pos >= slab_rebal.slab_end)
       break;
   }
 
+  // 判断是否处理完所有item
   if (slab_rebal.slab_pos >= slab_rebal.slab_end) {
-    /* Some items were busy, start again from the top */
+    // 如果有则重新把slab_pos指针重置到开始位置,然后重新一轮循环处理
     if (slab_rebal.busy_items) {
       slab_rebal.slab_pos = slab_rebal.slab_start;
       STATS_LOCK();
       stats.slab_reassign_busy_items += slab_rebal.busy_items;
       STATS_UNLOCK();
+      // 清零
       slab_rebal.busy_items = 0;
     } else {
+      // 当前chunk内所有item移除完毕
       slab_rebal.done++;
     }
   }
@@ -1000,26 +982,24 @@ static void slab_rebalance_finish(void) {
   }
 #endif
 
-  /* At this point the stolen slab is completely clear.
-   * We always kill the "first"/"oldest" slab page in the slab_list, so
-   * shuffle the page list backwards and decrement.
-   */
-  s_cls->slabs--;
+  s_cls->slabs--; // 源slab class的内存页数减一
   for (x = 0; x < s_cls->slabs; x++) {
     s_cls->slab_list[x] = s_cls->slab_list[x+1];
   }
 
   d_cls->slab_list[d_cls->slabs++] = slab_rebal.slab_start;
-  /* Don't need to split the page into chunks if we're just storing it */
   if (slab_rebal.d_clsid > SLAB_GLOBAL_PAGE_POOL) {
+    // 内存页所有字节清零, 这个也很重要的
     memset(slab_rebal.slab_start, 0, (size_t)settings.item_size_max);
+    // 按照目标slab class的item尺寸进行划分这个页
+    // 并且将这个页的内存并入到目标slab class的空闲item队列中
     split_slab_page_into_freelist(slab_rebal.slab_start,
       slab_rebal.d_clsid);
   } else if (slab_rebal.d_clsid == SLAB_GLOBAL_PAGE_POOL) {
-    /* mem_malloc'ed might be higher than mem_limit. */
     memory_release();
   }
 
+  // 做一些清零的操作.
   slab_rebal.done     = 0;
   slab_rebal.s_clsid  = 0;
   slab_rebal.d_clsid  = 0;
@@ -1034,7 +1014,7 @@ static void slab_rebalance_finish(void) {
   slab_rebal.inline_reclaim = 0;
   slab_rebal.rescues  = 0;
 
-  slab_rebalance_signal = 0;
+  slab_rebalance_signal = 0; // rebalance线程完成工作后，再次进入休眠状态
 
   pthread_mutex_unlock(&slabs_lock);
 
@@ -1052,36 +1032,30 @@ static void slab_rebalance_finish(void) {
   }
 }
 
-/* Slab mover thread.
- * Sits waiting for a condition to jump off and shovel some memory about
- */
 static void *slab_rebalance_thread(void *arg) {
   int was_busy = 0;
-  /* So we first pass into cond_wait with the mutex held */
   mutex_lock(&slabs_rebalance_lock);
 
   while (do_run_slab_rebalance_thread) {
     if (slab_rebalance_signal == 1) {
+      // 标志要移动的内存页的信息, 并将slab_rebalance_signal赋值为2
+      // slab_rebal.done赋值为0，表示没有完成
       if (slab_rebalance_start() < 0) {
-        /* Handle errors with more specifity as required. */
         slab_rebalance_signal = 0;
       }
 
       was_busy = 0;
     } else if (slab_rebalance_signal && slab_rebal.slab_start != NULL) {
-      was_busy = slab_rebalance_move();
+      was_busy = slab_rebalance_move(); // 进行内存页迁移操作
     }
 
-    if (slab_rebal.done) {
+    if (slab_rebal.done) { // 完成内存页重分配操作
       slab_rebalance_finish();
     } else if (was_busy) {
-      /* Stuck waiting for some items to unlock, so slow down a bit
-       * to give them a chance to free up */
-      usleep(50);
+      usleep(50); // 有worker线程在使用内存页上的item
     }
 
-    if (slab_rebalance_signal == 0) {
-      /* always hold this lock while we're running */
+    if (slab_rebalance_signal == 0) { // 一开始就在这里休眠
       pthread_cond_wait(&slab_rebalance_cond, &slabs_rebalance_lock);
     }
   }
@@ -1125,6 +1099,7 @@ static enum reassign_result_type do_slabs_reassign(int src, int dst) {
     dst < SLAB_GLOBAL_PAGE_POOL || dst > power_largest)
     return REASSIGN_BADCLASS;
 
+  // 如果该 slab id 下的 chunk 小于2块则不回收了.
   if (slabclass[src].slabs < 2)
     return REASSIGN_NOSPARE;
 
@@ -1177,7 +1152,7 @@ int start_slab_maintenance_thread(void) {
   pthread_mutex_init(&slabs_rebalance_lock, NULL);
 
   if ((ret = pthread_create(&rebalance_tid, NULL,
-                slab_rebalance_thread, NULL)) != 0) {
+      slab_rebalance_thread, NULL)) != 0) {
     fprintf(stderr, "Can't create rebal thread: %s\n", strerror(ret));
     return -1;
   }
